@@ -376,7 +376,7 @@ func (c *Client) saveRegistryAuth(auth RunpodRegistryAuth) (string, error) {
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 	
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != 200 && resp.StatusCode != 201 {
 		return "", fmt.Errorf("create registry auth failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	
