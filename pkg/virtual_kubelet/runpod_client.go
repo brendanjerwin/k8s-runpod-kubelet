@@ -1140,6 +1140,18 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	}
 	imageName := pod.Spec.Containers[0].Image
 
+	// Process imagePullSecrets if annotation is not already set
+	if containerRegistryAuthId == "" {
+		authID, err := c.ProcessImagePullSecrets(pod, imageName)
+		if err != nil {
+			c.logger.Warn("Failed to process imagePullSecrets", "error", err)
+			// Continue without auth - let Runpod try to pull the image
+		} else if authID != "" {
+			containerRegistryAuthId = authID
+			c.logger.Info("Using registry auth from imagePullSecrets", "authID", authID)
+		}
+	}
+
 	// Use the pod name as the RunPod name
 	runpodName := pod.Name
 
