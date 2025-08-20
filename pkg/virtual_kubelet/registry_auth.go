@@ -56,12 +56,11 @@ func (c *Client) ProcessImagePullSecrets(pod *v1.Pod, imageName string) (string,
 	}
 
 	// Process each imagePullSecret
+	var lastErr error
 	for _, secretRef := range pod.Spec.ImagePullSecrets {
 		authID, err := c.processImagePullSecret(pod.Namespace, secretRef.Name, registry)
 		if err != nil {
-			c.logger.Warn("Failed to process imagePullSecret",
-				"secret", secretRef.Name,
-				"error", err)
+			lastErr = fmt.Errorf("failed to process imagePullSecret %s: %w", secretRef.Name, err)
 			continue
 		}
 		
@@ -72,6 +71,11 @@ func (c *Client) ProcessImagePullSecrets(pod *v1.Pod, imageName string) (string,
 				"authID", authID)
 			return authID, nil
 		}
+	}
+	
+	// If we processed secrets but none worked, return the last error
+	if lastErr != nil {
+		return "", lastErr
 	}
 
 	return "", nil
@@ -117,10 +121,7 @@ func (c *Client) processDockerConfigJsonSecret(secret *v1.Secret, targetRegistry
 		if matchesRegistry(registry, targetRegistry) {
 			username, password, err := extractCredentials(authEntry)
 			if err != nil {
-				c.logger.Warn("Failed to extract credentials",
-					"registry", registry,
-					"error", err)
-				continue
+				return "", fmt.Errorf("failed to extract credentials for registry %s: %w", registry, err)
 			}
 
 			return c.createRunpodRegistryAuth(registry, username, password)
@@ -148,10 +149,7 @@ func (c *Client) processDockerCfgSecret(secret *v1.Secret, targetRegistry string
 		if matchesRegistry(registry, targetRegistry) {
 			username, password, err := extractCredentials(authEntry)
 			if err != nil {
-				c.logger.Warn("Failed to extract credentials",
-					"registry", registry,
-					"error", err)
-				continue
+				return "", fmt.Errorf("failed to extract credentials for registry %s: %w", registry, err)
 			}
 
 			return c.createRunpodRegistryAuth(registry, username, password)
@@ -255,8 +253,8 @@ func (c *Client) createRunpodRegistryAuth(registry, username, password string) (
 			// Credentials have changed - delete the old one first
 			c.logger.Info("Registry auth credentials have changed, recreating", "authName", authName, "oldID", existingAuth.ID)
 			if deleteErr := c.deleteRegistryAuth(existingAuth.ID); deleteErr != nil {
+				// Log but don't fail - deletion failure is not critical
 				c.logger.Warn("Failed to delete old registry auth", "authID", existingAuth.ID, "error", deleteErr)
-				// Continue with creation attempt - maybe the delete wasn't necessary
 			}
 		}
 	}

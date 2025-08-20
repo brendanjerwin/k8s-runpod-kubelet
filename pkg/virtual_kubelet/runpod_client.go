@@ -1144,8 +1144,7 @@ func (c *Client) PrepareRunPodParameters(pod *v1.Pod, graphql bool) (map[string]
 	if containerRegistryAuthId == "" {
 		authID, err := c.ProcessImagePullSecrets(pod, imageName)
 		if err != nil {
-			c.logger.Warn("Failed to process imagePullSecrets", "error", err)
-			// Continue without auth - let Runpod try to pull the image
+			return nil, fmt.Errorf("failed to process imagePullSecrets for pod %s/%s: %w", pod.Namespace, pod.Name, err)
 		} else if authID != "" {
 			containerRegistryAuthId = authID
 			c.logger.Info("Using registry auth from imagePullSecrets", "authID", authID)
