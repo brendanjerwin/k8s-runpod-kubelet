@@ -31,7 +31,6 @@ type RunpodRegistryAuth struct {
 	Name     string `json:"name"`
 	Username string `json:"username"`
 	Password string `json:"password"`
-	Registry string `json:"registry"`
 }
 
 // RunpodRegistryAuthResponse represents the response from Runpod registry auth API
@@ -249,7 +248,7 @@ func (c *Client) createRunpodRegistryAuth(registry, username, password string) (
 		c.logger.Debug("No existing registry auth found or error retrieving", "authName", authName, "error", err)
 	} else {
 		// Compare existing credentials with current ones
-		if existingAuth.Username == username && existingAuth.Registry == registry {
+		if existingAuth.Username == username {
 			c.logger.Debug("Found existing registry auth with matching credentials", "authName", authName, "authID", existingAuth.ID)
 			return existingAuth.ID, nil
 		} else {
@@ -267,7 +266,6 @@ func (c *Client) createRunpodRegistryAuth(registry, username, password string) (
 		Name:     authName,
 		Username: username,
 		Password: password,
-		Registry: registry,
 	}
 	
 	authID, err := c.saveRegistryAuth(authPayload)
@@ -389,8 +387,7 @@ func (c *Client) saveRegistryAuth(auth RunpodRegistryAuth) (string, error) {
 	
 	c.logger.Info("Created new registry auth",
 		"authName", auth.Name,
-		"authID", response.ID,
-		"registry", auth.Registry)
+		"authID", response.ID)
 	
 	return response.ID, nil
 }
