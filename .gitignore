@@ -5,6 +5,9 @@
 *.so
 *.dylib
 
+# Built binary
+k8s-runpod-kubelet
+
 # Test binary, built with `go test -c`
 *.test
 
