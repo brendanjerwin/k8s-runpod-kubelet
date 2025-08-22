@@ -43,6 +43,10 @@ type RunpodRegistryAuthResponse struct {
 
 // ProcessImagePullSecrets extracts registry credentials from imagePullSecrets and returns a Runpod auth ID
 func (c *Client) ProcessImagePullSecrets(pod *v1.Pod, imageName string) (string, error) {
+	// Lock the mutex to prevent race conditions in registry auth operations
+	c.registryAuthMutex.Lock()
+	defer c.registryAuthMutex.Unlock()
+
 	if len(pod.Spec.ImagePullSecrets) == 0 {
 		c.logger.Debug("No imagePullSecrets found for pod", "pod", pod.Name)
 		return "", nil
@@ -346,7 +350,7 @@ func (c *Client) deleteRegistryAuth(authID string) error {
 	return nil
 }
 
-// saveRegistryAuth saves registry auth to Runpod and returns the auth ID
+// saveRegistryAuth saves registry auth to Runpod and returns the auth ID with retry logic
 func (c *Client) saveRegistryAuth(auth RunpodRegistryAuth) (string, error) {
 	// Use REST API to create registry auth
 	payload, err := json.Marshal(auth)
@@ -354,38 +358,79 @@ func (c *Client) saveRegistryAuth(auth RunpodRegistryAuth) (string, error) {
 		return "", fmt.Errorf("failed to marshal auth payload: %w", err)
 	}
 	
-	req, err := http.NewRequest("POST", "https://rest.runpod.io/v1/containerregistryauth", strings.NewReader(string(payload)))
-	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
-	}
+	maxRetries := 3
+	backoffDuration := time.Second
 	
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("failed to create registry auth: %w", err)
-	}
-	defer resp.Body.Close()
-	
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read response body: %w", err)
-	}
-	
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequest("POST", "https://rest.runpod.io/v1/containerregistryauth", strings.NewReader(string(payload)))
+		if err != nil {
+			return "", fmt.Errorf("failed to create request: %w", err)
+		}
+		
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			if attempt < maxRetries {
+				c.logger.Warn("Registry auth creation failed, retrying", 
+					"attempt", attempt, 
+					"maxRetries", maxRetries,
+					"error", err)
+				time.Sleep(backoffDuration)
+				backoffDuration *= 2 // Exponential backoff
+				continue
+			}
+			return "", fmt.Errorf("failed to create registry auth after %d attempts: %w", maxRetries, err)
+		}
+		defer resp.Body.Close()
+		
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			if attempt < maxRetries {
+				c.logger.Warn("Failed to read response body, retrying", 
+					"attempt", attempt, 
+					"maxRetries", maxRetries,
+					"error", err)
+				time.Sleep(backoffDuration)
+				backoffDuration *= 2
+				continue
+			}
+			return "", fmt.Errorf("failed to read response body after %d attempts: %w", maxRetries, err)
+		}
+		
+		if resp.StatusCode == 200 || resp.StatusCode == 201 {
+			// Success case - parse response
+			var response RunpodRegistryAuthResponse
+			if err := json.Unmarshal(body, &response); err != nil {
+				return "", fmt.Errorf("failed to decode response: %w", err)
+			}
+			
+			c.logger.Info("Created new registry auth",
+				"authName", auth.Name,
+				"authID", response.ID,
+				"attempt", attempt)
+			
+			return response.ID, nil
+		}
+		
+		// Handle different error status codes
+		if resp.StatusCode >= 500 && attempt < maxRetries {
+			// Server error - retry
+			c.logger.Warn("Server error creating registry auth, retrying",
+				"statusCode", resp.StatusCode,
+				"attempt", attempt,
+				"maxRetries", maxRetries,
+				"response", string(body))
+			time.Sleep(backoffDuration)
+			backoffDuration *= 2
+			continue
+		}
+		
+		// Client error or final attempt - don't retry
 		return "", fmt.Errorf("create registry auth failed with status %d: %s", resp.StatusCode, string(body))
 	}
 	
-	var response RunpodRegistryAuthResponse
-	if err := json.Unmarshal(body, &response); err != nil {
-		return "", fmt.Errorf("failed to decode response: %w", err)
-	}
-	
-	c.logger.Info("Created new registry auth",
-		"authName", auth.Name,
-		"authID", response.ID)
-	
-	return response.ID, nil
+	return "", fmt.Errorf("failed to create registry auth after %d attempts", maxRetries)
 }

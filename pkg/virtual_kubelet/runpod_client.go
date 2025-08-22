@@ -16,17 +16,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Client handles all interactions with the RunPod API
 type Client struct {
-	httpClient     *http.Client
-	apiKey         string
-	baseGraphqlURL string
-	baseRESTURL    string
-	logger         *slog.Logger
-	clientset      *kubernetes.Clientset // Add clientset field
+	httpClient        *http.Client
+	apiKey            string
+	baseGraphqlURL    string
+	baseRESTURL       string
+	logger            *slog.Logger
+	clientset         *kubernetes.Clientset // Add clientset field
+	registryAuthMutex *sync.Mutex           // Shared mutex for registry auth operations
 }
 
 // Constants for RunPod integration
@@ -91,28 +93,32 @@ type GPUType struct {
 
 // InstanceInfo stores information about a RunPod instance in the cluster
 type InstanceInfo struct {
-	ID            string
-	CostPerHr     float64
-	PodName       string
-	Namespace     string
-	Status        string
-	StatusMessage string
-	ExitCode      int
-	CreationTime  time.Time
+	ID                    string
+	CostPerHr             float64
+	PodName               string
+	Namespace             string
+	Status                string
+	StatusMessage         string
+	ExitCode              int
+	CreationTime          time.Time
+	DeploymentAttempted   bool      // Track if deployment was attempted for this pod
+	LastDeploymentAttempt time.Time // Track when the last deployment attempt was made
+	DeploymentRetries     int       // Track number of deployment retries
 }
 
 type DetailedStatus struct {
-	ID            string            `json:"id"`
-	Name          string            `json:"name"`
-	DesiredStatus string            `json:"desiredStatus"`
-	CurrentStatus string            `json:"currentStatus,omitempty"`
-	CostPerHr     float64           `json:"costPerHr"`
-	Image         string            `json:"image"`
-	Env           map[string]string `json:"env"`
-	MachineID     string            `json:"machineId"`
-	Runtime       *RuntimeInfo      `json:"runtime,omitempty"`
-	Machine       *MachineInfo      `json:"machine,omitempty"`
-	LastError     string            `json:"lastError,omitempty"`
+	ID            string                   `json:"id"`
+	Name          string                   `json:"name"`
+	DesiredStatus string                   `json:"desiredStatus"`
+	CurrentStatus string                   `json:"currentStatus,omitempty"`
+	CostPerHr     float64                  `json:"costPerHr"`
+	Image         string                   `json:"image"`
+	Env           map[string]string        `json:"env"`
+	MachineID     string                   `json:"machineId"`
+	PortMappings  *[]map[string]interface{} `json:"portMappings"`
+	Runtime       *RuntimeInfo             `json:"runtime,omitempty"`
+	Machine       *MachineInfo             `json:"machine,omitempty"`
+	LastError     string                   `json:"lastError,omitempty"`
 }
 
 type RuntimeInfo struct {
@@ -130,19 +136,20 @@ type MachineInfo struct {
 }
 
 // NewRunPodClient creates a new RunPod API client
-func NewRunPodClient(logger *slog.Logger, clientset *kubernetes.Clientset) *Client {
+func NewRunPodClient(logger *slog.Logger, clientset *kubernetes.Clientset, registryAuthMutex *sync.Mutex) *Client {
 	apiKey := os.Getenv("RUNPOD_API_KEY")
 	if apiKey == "" {
 		logger.Error("RUNPOD_API_KEY environment variable is not set")
 	}
 
 	return &Client{
-		httpClient:     &http.Client{Timeout: DefaultAPITimeout},
-		apiKey:         apiKey,
-		baseGraphqlURL: "https://api.runpod.io/graphql",
-		baseRESTURL:    "https://rest.runpod.io/v1/",
-		logger:         logger,
-		clientset:      clientset, // Store the clientset
+		httpClient:        &http.Client{Timeout: DefaultAPITimeout},
+		apiKey:            apiKey,
+		baseGraphqlURL:    "https://api.runpod.io/graphql",
+		baseRESTURL:       "https://rest.runpod.io/v1/",
+		logger:            logger,
+		clientset:         clientset,         // Store the clientset
+		registryAuthMutex: registryAuthMutex, // Store the shared mutex
 	}
 }
 
@@ -680,7 +687,7 @@ func (c *Client) DeployPod(params map[string]interface{}) (string, float64, erro
 	return response.Data.PodFindAndDeployOnDemand.ID, response.Data.PodFindAndDeployOnDemand.CostPerHr, nil
 }
 
-// TerminatePod terminates a RunPod instance by ID
+// TerminatePod stops a RunPod instance by ID (pauses, can be restarted)
 func (c *Client) TerminatePod(podID string) error {
 	endpoint := fmt.Sprintf("/pods/%s/stop", podID)
 
@@ -707,6 +714,43 @@ func (c *Client) TerminatePod(podID string) error {
 		return fmt.Errorf("failed to terminate pod, status: %d, response: %s", resp.StatusCode, string(body))
 	}
 
+	return nil
+}
+
+// DeletePod permanently deletes a RunPod instance by ID (cannot be restarted)
+func (c *Client) DeletePod(podID string) error {
+	endpoint := fmt.Sprintf("/pods/%s", podID)
+
+	resp, err := c.makeRESTRequest("DELETE", endpoint, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			c.logger.Warn("Error closing response body", "error", err)
+		}
+	}()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("unauthorized: invalid API key")
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		// Pod already deleted - this is ok
+		c.logger.Debug("Pod already deleted or not found", "podID", podID)
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusBadRequest {
+		return fmt.Errorf("invalid pod ID: %s", podID)
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to delete pod, status: %d, response: %s", resp.StatusCode, string(body))
+	}
+
+	c.logger.Info("Successfully deleted RunPod instance", "podID", podID)
 	return nil
 }
 

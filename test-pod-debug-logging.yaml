@@ -1,0 +1,46 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-runpod-debug-logs
+  labels:
+    app: test-runpod-debug-logs
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    provider: runpod
+  imagePullSecrets:
+    - name: github-oci-registry-credentials
+  containers:
+    - name: debug-test
+      image: ghcr.io/brendanjerwin/runpod-ml-base:latest
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          echo "=== Starting Debug Test with Enhanced Logging ==="
+          echo "GPU info:"
+          nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits || echo "GPU query failed"
+          
+          echo "=== Starting supervisor with debug logging ==="
+          echo "Supervisor will log at debug level and Tailscale at maximum verbosity"
+          
+          # Start supervisor which will start our services with debug logging
+          exec supervisord -c /etc/supervisor/conf.d/supervisord.conf
+      env:
+        - name: TAILSCALE_AUTH_KEY
+          valueFrom:
+            secretKeyRef:
+              name: runpod-tailscale-auth
+              key: ephemeral_key
+        # Override OTLP endpoint to use Tailscale network
+        - name: OTLP_ENDPOINT
+          value: "signoz-otel.monster-orfe.ts.net:4317"
+      resources:
+        requests:
+          memory: "2Gi"
+        limits:
+          memory: "4Gi"
+  tolerations:
+    - key: "virtual-kubelet.io/provider"
+      operator: "Equal"
+      value: "runpod"
+      effect: "NoSchedule"

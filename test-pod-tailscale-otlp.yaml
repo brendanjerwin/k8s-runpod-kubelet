@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-runpod-tailscale-otlp
+  labels:
+    app: test-runpod-tailscale-otlp
+spec:
+  restartPolicy: Never
+  nodeSelector:
+    provider: runpod
+  imagePullSecrets:
+    - name: github-oci-registry-credentials
+  containers:
+    - name: tailscale-otlp-test
+      image: ghcr.io/brendanjerwin/runpod-ml-base:latest
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          echo "Starting Tailscale and OTLP test..."
+          echo "GPU info:"
+          nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits || echo "GPU query failed"
+          
+          echo "Waiting for Tailscale to connect..."
+          sleep 30
+          
+          echo "Testing Tailscale connectivity:"
+          tailscale --socket=/var/lib/tailscale/tailscaled.sock status || echo "Tailscale status failed"
+          
+          echo "Testing network connectivity to SigNoz:"
+          ping -c 3 signoz-otel.monster-orfe.ts.net || echo "SigNoz ping failed"
+          
+          echo "Generating test logs and metrics..."
+          for i in {1..10}; do
+            echo "Test log entry $i: $(date)"
+            sleep 5
+          done
+          
+          echo "Test completed. Sleeping for 5 minutes to observe telemetry..."
+          sleep 300
+      env:
+        - name: TAILSCALE_AUTH_KEY
+          valueFrom:
+            secretKeyRef:
+              name: runpod-tailscale-auth
+              key: ephemeral_key
+        - name: OTLP_ENDPOINT
+          value: "signoz-otel-collector-tailscale.signoz:4317"
+        - name: OTEL_SERVICE_NAME
+          value: "test-tailscale-otlp"
+        - name: SERVICE_VERSION
+          value: "1.0.0"
+        - name: GPU_TYPE
+          value: "auto-detected"
+      resources:
+        requests:
+          memory: "4Gi"
+        limits:
+          memory: "8Gi"
+  tolerations:
+    - key: "virtual-kubelet.io/provider"
+      operator: "Equal"
+      value: "runpod"
+      effect: "NoSchedule"
