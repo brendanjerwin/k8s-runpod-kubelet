@@ -104,6 +104,7 @@ type InstanceInfo struct {
 	DeploymentAttempted   bool      // Track if deployment was attempted for this pod
 	LastDeploymentAttempt time.Time // Track when the last deployment attempt was made
 	DeploymentRetries     int       // Track number of deployment retries
+	HasExposedPorts       bool      // Track if container has exposed ports (indicates readiness)
 }
 
 type DetailedStatus struct {
@@ -115,7 +116,7 @@ type DetailedStatus struct {
 	Image         string                   `json:"image"`
 	Env           map[string]string        `json:"env"`
 	MachineID     string                   `json:"machineId"`
-	PortMappings  *[]map[string]interface{} `json:"portMappings"`
+	PortMappings  map[string]interface{} `json:"portMappings"`
 	Runtime       *RuntimeInfo             `json:"runtime,omitempty"`
 	Machine       *MachineInfo             `json:"machine,omitempty"`
 	LastError     string                   `json:"lastError,omitempty"`

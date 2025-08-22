@@ -145,6 +145,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 		DeploymentAttempted:   true,      // Mark deployment as attempted immediately
 		LastDeploymentAttempt: time.Now(), // Record when deployment attempt started
 		DeploymentRetries:     0,          // Initialize retry count
+		HasExposedPorts:       false,      // Initially no ports are exposed
 	}
 	p.podsMutex.Unlock()
 
@@ -295,12 +296,13 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 		p.podStatus[podKey] = podInfo
 	} else {
 		p.podStatus[podKey] = &InstanceInfo{
-			ID:           podID,
-			CostPerHr:    costPerHr,
-			PodName:      pod.Name,
-			Namespace:    pod.Namespace,
-			Status:       string(PodStarting),
-			CreationTime: time.Now(),
+			ID:              podID,
+			CostPerHr:       costPerHr,
+			PodName:         pod.Name,
+			Namespace:       pod.Namespace,
+			Status:          string(PodStarting),
+			CreationTime:    time.Now(),
+			HasExposedPorts: false, // Initially no ports are exposed
 		}
 	}
 	p.podsMutex.Unlock()
@@ -614,14 +616,19 @@ func (p *Provider) updateAllPodStatuses() {
 		}
 
 		// Check if container has exposed ports (indicates it's actually ready)
-		hasExposedPorts := detailedStatus.PortMappings != nil && len(*detailedStatus.PortMappings) > 0
+		hasExposedPorts := len(detailedStatus.PortMappings) > 0
 
-		// Update pod info if status changed
-		if string(status) != podInfo.Status {
+		// Update pod info if status changed OR port exposure changed
+		statusChanged := string(status) != podInfo.Status
+		portExposureChanged := hasExposedPorts != podInfo.HasExposedPorts
+		
+		if statusChanged || portExposureChanged {
 			// Update status in our tracking map
 			p.podsMutex.Lock()
 			oldStatus := podInfo.Status
+			oldPortExposure := podInfo.HasExposedPorts
 			podInfo.Status = string(status)
+			podInfo.HasExposedPorts = hasExposedPorts
 			p.podStatus[podKey] = podInfo
 			p.podsMutex.Unlock()
 
@@ -634,11 +641,28 @@ func (p *Provider) updateAllPodStatuses() {
 				p.mergeContainerStatus(newStatus, pod.Status.ContainerStatuses[0])
 			}
 
-			p.logger.Info("Pod status changed",
-				"pod", pod.Name,
-				"namespace", pod.Namespace,
-				"prevStatus", oldStatus,
-				"newStatus", string(status))
+			if statusChanged && portExposureChanged {
+				p.logger.Info("Pod status and port exposure changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"prevStatus", oldStatus,
+					"newStatus", string(status),
+					"prevPortsExposed", oldPortExposure,
+					"newPortsExposed", hasExposedPorts)
+			} else if statusChanged {
+				p.logger.Info("Pod status changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"prevStatus", oldStatus,
+					"newStatus", string(status))
+			} else if portExposureChanged {
+				p.logger.Info("Pod port exposure changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"status", string(status),
+					"prevPortsExposed", oldPortExposure,
+					"newPortsExposed", hasExposedPorts)
+			}
 
 			// Handle pod completion if needed
 			if status == PodExited {
