@@ -40,6 +40,12 @@ type Provider struct {
 	podsMutex   sync.RWMutex             // Mutex for thread-safe access to pods maps
 	notifyFunc  func(*v1.Pod)            // Function called when pod status changes
 	notifyMutex sync.RWMutex             // Mutex for thread-safe access to notify function
+
+	// For registry auth synchronization
+	registryAuthMutex sync.Mutex // Mutex for registry auth operations to prevent race conditions
+	
+	// For deployment synchronization
+	deploymentMutex sync.Mutex // Mutex for deployment operations to prevent concurrent deployments of same pod
 }
 
 // startPeriodicStatusUpdates polls the RunPod API to keep pod statuses up to date
@@ -88,9 +94,6 @@ func (p *Provider) checkRunPodAPIHealth() {
 func NewProvider(ctx context.Context, nodeName, operatingSystem string, internalIP string,
 	daemonEndpointPort int, config config.Config, clientset *kubernetes.Clientset, logger *slog.Logger) (*Provider, error) {
 
-	// Create a new RunPod client and pass the clientset
-	runpodClient := NewRunPodClient(logger, clientset)
-
 	provider := &Provider{
 		nodeName:           nodeName,
 		clientset:          clientset,
@@ -99,14 +102,18 @@ func NewProvider(ctx context.Context, nodeName, operatingSystem string, internal
 		daemonEndpointPort: daemonEndpointPort,
 		logger:             logger,
 		config:             config,
-		runpodClient:       runpodClient,
 		runpodAvailable:    false,
 		deletedPods:        make(map[string]string),
 		deletedPodsMutex:   sync.Mutex{},
 		pods:               make(map[string]*v1.Pod),
 		podStatus:          make(map[string]*InstanceInfo),
 		podsMutex:          sync.RWMutex{},
+		registryAuthMutex:  sync.Mutex{}, // Initialize the registry auth mutex
 	}
+
+	// Create a new RunPod client and pass the provider's registry auth mutex
+	runpodClient := NewRunPodClient(logger, clientset, &provider.registryAuthMutex)
+	provider.runpodClient = runpodClient
 
 	// Initialize provider
 	provider.checkRunPodAPIHealth()
@@ -131,10 +138,14 @@ func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	p.podsMutex.Lock()
 	p.pods[podKey] = pod.DeepCopy()
 	p.podStatus[podKey] = &InstanceInfo{
-		PodName:      pod.Name,
-		Namespace:    pod.Namespace,
-		Status:       string(PodStarting),
-		CreationTime: time.Now(),
+		PodName:               pod.Name,
+		Namespace:             pod.Namespace,
+		Status:                string(PodStarting),
+		CreationTime:          time.Now(),
+		DeploymentAttempted:   true,      // Mark deployment as attempted immediately
+		LastDeploymentAttempt: time.Now(), // Record when deployment attempt started
+		DeploymentRetries:     0,          // Initialize retry count
+		HasExposedPorts:       false,      // Initially no ports are exposed
 	}
 	p.podsMutex.Unlock()
 
@@ -171,6 +182,13 @@ func (p *Provider) UpdatePod(ctx context.Context, pod *v1.Pod) error {
 
 // DeployPodToRunPod handles the deployment of a Kubernetes pod to RunPod
 func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
+	// Use deployment mutex to prevent concurrent deployments of the same pod
+	podKey := fmt.Sprintf("%s-%s", pod.Namespace, pod.Name)
+	
+	// Create a per-pod deployment lock using a map of mutexes if needed
+	// For simplicity, we'll use a global deployment mutex for now
+	p.deploymentMutex.Lock()
+	defer p.deploymentMutex.Unlock()
 	// Add datacenter IDs annotation if globally configured
 	if p.config.DatacenterIDs != "" && pod.Annotations[DatacenterAnnotation] == "" {
 		// Copy pod to add annotation
@@ -220,6 +238,17 @@ func (p *Provider) DeployPodToRunPod(pod *v1.Pod) error {
 		return err
 	}
 
+	// RACE CONDITION FIX: Update local tracking immediately to prevent duplicate pod creation
+	p.podsMutex.Lock()
+	if podInfo, exists := p.podStatus[podKey]; exists {
+		podInfo.ID = podID
+		podInfo.CostPerHr = costPerHr
+		podInfo.Status = string(PodStarting)
+	}
+	p.podsMutex.Unlock()
+
+	p.logger.Info("Pod deployed successfully", "podId", podID, "costPerHr", costPerHr)
+
 	// Update pod with RunPod annotations
 	return p.updatePodWithRunPodInfo(pod, podID, costPerHr)
 }
@@ -267,12 +296,13 @@ func (p *Provider) updatePodWithRunPodInfo(pod *v1.Pod, podID string, costPerHr 
 		p.podStatus[podKey] = podInfo
 	} else {
 		p.podStatus[podKey] = &InstanceInfo{
-			ID:           podID,
-			CostPerHr:    costPerHr,
-			PodName:      pod.Name,
-			Namespace:    pod.Namespace,
-			Status:       string(PodStarting),
-			CreationTime: time.Now(),
+			ID:              podID,
+			CostPerHr:       costPerHr,
+			PodName:         pod.Name,
+			Namespace:       pod.Namespace,
+			Status:          string(PodStarting),
+			CreationTime:    time.Now(),
+			HasExposedPorts: false, // Initially no ports are exposed
 		}
 	}
 	p.podsMutex.Unlock()
@@ -306,9 +336,9 @@ func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) error {
 		p.deletedPods[podKey] = podID
 		p.deletedPodsMutex.Unlock()
 
-		// Attempt to terminate RunPod instance
-		if err := p.runpodClient.TerminatePod(podID); err != nil {
-			p.logger.Error("Failed to terminate RunPod instance",
+		// Attempt to delete RunPod instance permanently
+		if err := p.runpodClient.DeletePod(podID); err != nil {
+			p.logger.Error("Failed to delete RunPod instance",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
 				"podID", podID,
@@ -356,7 +386,8 @@ func (p *Provider) GetPodStatus(ctx context.Context, namespace, name string) (*v
 	}
 
 	// Translate RunPod status to Kubernetes PodStatus
-	return p.translateRunPodStatus(podInfo.Status, podInfo.StatusMessage), nil
+	// For GetPodStatus, we don't have detailed port info, so assume false for ports
+	return p.translateRunPodStatus(podInfo.Status, podInfo.StatusMessage, false), nil
 }
 
 // GetPods retrieves a list of all pods running on the provider
@@ -422,6 +453,7 @@ func (p *Provider) processPendingPods() {
 	for _, podKey := range podKeys {
 		p.podsMutex.RLock()
 		pod := p.pods[podKey]
+		podInfo := p.podStatus[podKey]
 		p.podsMutex.RUnlock()
 
 		if pod == nil {
@@ -435,6 +467,62 @@ func (p *Provider) processPendingPods() {
 				"namespace", pod.Namespace,
 				"runpodID", podID)
 			continue
+		}
+
+		// Check if deployment was already attempted and if we should retry
+		if podInfo != nil && podInfo.DeploymentAttempted {
+			// Calculate time since last deployment attempt
+			timeSinceLastAttempt := time.Since(podInfo.LastDeploymentAttempt)
+			
+			// Exponential backoff: 30s, 60s, 120s, 240s, 480s (max 8 minutes)
+			minRetryInterval := time.Duration(30<<uint(podInfo.DeploymentRetries)) * time.Second
+			if minRetryInterval > 8*time.Minute {
+				minRetryInterval = 8 * time.Minute
+			}
+			
+			// Max retries is 10 attempts
+			if podInfo.DeploymentRetries >= 10 {
+				p.logger.Warn("Pod deployment failed after maximum retries, marking as failed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"retries", podInfo.DeploymentRetries)
+				
+				// Mark pod as failed
+				p.podsMutex.Lock()
+				if podInfo, exists := p.podStatus[podKey]; exists {
+					podInfo.Status = string(PodExited)
+					podInfo.StatusMessage = "Maximum deployment retries exceeded"
+					p.podStatus[podKey] = podInfo
+				}
+				p.podsMutex.Unlock()
+				continue
+			}
+			
+			// Skip if not enough time has passed for retry
+			if timeSinceLastAttempt < minRetryInterval {
+				p.logger.Debug("Skipping pod deployment retry, not enough time elapsed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"timeSinceLastAttempt", timeSinceLastAttempt,
+					"minRetryInterval", minRetryInterval,
+					"retries", podInfo.DeploymentRetries)
+				continue
+			}
+			
+			p.logger.Info("Retrying pod deployment",
+				"pod", pod.Name,
+				"namespace", pod.Namespace,
+				"retries", podInfo.DeploymentRetries,
+				"timeSinceLastAttempt", timeSinceLastAttempt)
+			
+			// Update retry information
+			p.podsMutex.Lock()
+			if podInfo, exists := p.podStatus[podKey]; exists {
+				podInfo.DeploymentRetries++
+				podInfo.LastDeploymentAttempt = time.Now()
+				p.podStatus[podKey] = podInfo
+			}
+			p.podsMutex.Unlock()
 		}
 
 		// Try to deploy the pod to RunPod
@@ -507,10 +595,10 @@ func (p *Provider) updateAllPodStatuses() {
 			continue
 		}
 
-		// Check current status from RunPod API
-		status, err := p.runpodClient.GetPodStatusREST(podID)
+		// Get detailed status from RunPod API to check for exposed ports
+		detailedStatus, err := p.runpodClient.GetDetailedPodStatus(podID)
 		if err != nil {
-			p.logger.Error("Failed to get pod status from RunPod API",
+			p.logger.Error("Failed to get detailed pod status from RunPod API",
 				"pod", pod.Name, "namespace", pod.Namespace,
 				"runpodID", podID, "error", err)
 
@@ -518,23 +606,34 @@ func (p *Provider) updateAllPodStatuses() {
 			continue
 		}
 
+		// Convert to PodStatus for compatibility
+		status := PodStatus(detailedStatus.DesiredStatus)
+
 		// If status is NOT_FOUND, use shared handler
 		if status == PodNotFound {
 			p.handleMissingRunPodInstance(pod, podKey, podID)
 			continue // Skip the rest of the status update logic
 		}
 
-		// Update pod info if status changed
-		if string(status) != podInfo.Status {
+		// Check if container has exposed ports (indicates it's actually ready)
+		hasExposedPorts := len(detailedStatus.PortMappings) > 0
+
+		// Update pod info if status changed OR port exposure changed
+		statusChanged := string(status) != podInfo.Status
+		portExposureChanged := hasExposedPorts != podInfo.HasExposedPorts
+		
+		if statusChanged || portExposureChanged {
 			// Update status in our tracking map
 			p.podsMutex.Lock()
 			oldStatus := podInfo.Status
+			oldPortExposure := podInfo.HasExposedPorts
 			podInfo.Status = string(status)
+			podInfo.HasExposedPorts = hasExposedPorts
 			p.podStatus[podKey] = podInfo
 			p.podsMutex.Unlock()
 
-			// Create the new Kubernetes PodStatus with proper error handling
-			newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage)
+			// Create the new Kubernetes PodStatus with port information
+			newStatus := p.translateRunPodStatus(string(status), podInfo.StatusMessage, hasExposedPorts)
 
 			// Keep existing container state if possible
 			if len(pod.Status.ContainerStatuses) > 0 && newStatus != nil {
@@ -542,11 +641,28 @@ func (p *Provider) updateAllPodStatuses() {
 				p.mergeContainerStatus(newStatus, pod.Status.ContainerStatuses[0])
 			}
 
-			p.logger.Info("Pod status changed",
-				"pod", pod.Name,
-				"namespace", pod.Namespace,
-				"prevStatus", oldStatus,
-				"newStatus", string(status))
+			if statusChanged && portExposureChanged {
+				p.logger.Info("Pod status and port exposure changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"prevStatus", oldStatus,
+					"newStatus", string(status),
+					"prevPortsExposed", oldPortExposure,
+					"newPortsExposed", hasExposedPorts)
+			} else if statusChanged {
+				p.logger.Info("Pod status changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"prevStatus", oldStatus,
+					"newStatus", string(status))
+			} else if portExposureChanged {
+				p.logger.Info("Pod port exposure changed",
+					"pod", pod.Name,
+					"namespace", pod.Namespace,
+					"status", string(status),
+					"prevPortsExposed", oldPortExposure,
+					"newPortsExposed", hasExposedPorts)
+			}
 
 			// Handle pod completion if needed
 			if status == PodExited {
@@ -673,8 +789,8 @@ func (p *Provider) handlePodCompletion(pod *v1.Pod, podInfo *InstanceInfo) {
 	// Determine if success or failure
 	isSuccess := IsSuccessfulCompletion(status)
 
-	// Update pod status
-	podStatus := p.translateRunPodStatus(string(PodExited), exitMessage)
+	// Update pod status (exited pods don't need port check)
+	podStatus := p.translateRunPodStatus(string(PodExited), exitMessage, false)
 	if isSuccess {
 		podStatus.Phase = v1.PodSucceeded
 		if len(podStatus.ContainerStatuses) > 0 && podStatus.ContainerStatuses[0].State.Terminated != nil {
@@ -858,8 +974,8 @@ func (p *Provider) cleanupDeletedPods() {
 				"name", name,
 				"runpodID", runpodID)
 
-			if err := p.runpodClient.TerminatePod(runpodID); err != nil {
-				p.logger.Error("Failed to terminate RunPod instance during cleanup",
+			if err := p.runpodClient.DeletePod(runpodID); err != nil {
+				p.logger.Error("Failed to delete RunPod instance during cleanup",
 					"runpodID", runpodID, "err", err)
 			}
 
@@ -980,9 +1096,9 @@ func (p *Provider) cleanupStuckTerminatingPods() {
 						"runpodID", podID,
 						"terminatingDuration", terminatingDuration)
 
-					// Try to terminate the RunPod instance again
-					if err := p.runpodClient.TerminatePod(podID); err != nil {
-						p.logger.Error("Failed to re-terminate RunPod instance",
+					// Try to delete the RunPod instance again
+					if err := p.runpodClient.DeletePod(podID); err != nil {
+						p.logger.Error("Failed to re-delete RunPod instance",
 							"pod", pod.Name,
 							"namespace", pod.Namespace,
 							"runpodID", podID,
@@ -1390,8 +1506,8 @@ func (p *Provider) handleMissingRunPodInstance(pod *v1.Pod, podKey string, runpo
 			"error", err)
 	}
 
-	// Update pod status to Failed to prevent redeployment
-	failedStatus := p.translateRunPodStatus(string(PodNotFound), "RunPod instance was deleted")
+	// Update pod status to Failed to prevent redeployment (failed pods don't need port check)
+	failedStatus := p.translateRunPodStatus(string(PodNotFound), "RunPod instance was deleted", false)
 	err = p.updatePodStatusInK8s(currentPod, failedStatus)
 	if err != nil {
 		p.logger.Error("Failed to update pod status to Failed",
@@ -1474,7 +1590,7 @@ func (p *Provider) updatePodStatusInK8s(pod *v1.Pod, newStatus *v1.PodStatus) er
 }
 
 // translateRunPodStatus converts a RunPod status string to a Kubernetes PodStatus
-func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage string) *v1.PodStatus {
+func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage string, hasExposedPorts bool) *v1.PodStatus {
 	now := metav1.NewTime(time.Now())
 	startTime := metav1.NewTime(now.Add(-1 * time.Hour)) // Default start time
 
@@ -1491,18 +1607,32 @@ func (p *Provider) translateRunPodStatus(runpodStatus string, statusMessage stri
 	// Default to Unknown phase
 	phase := v1.PodUnknown
 
-	// Set container state and phase based on RunPod status
+	// Set container state and phase based on RunPod status and port exposure
 	switch runpodStatus {
 	case string(PodRunning):
-		phase = v1.PodRunning
-		containerStatus.State = v1.ContainerState{
-			Running: &v1.ContainerStateRunning{
-				StartedAt: startTime,
-			},
+		if hasExposedPorts {
+			// Container is truly running and ready
+			phase = v1.PodRunning
+			containerStatus.State = v1.ContainerState{
+				Running: &v1.ContainerStateRunning{
+					StartedAt: startTime,
+				},
+			}
+			containerStatus.Ready = true
+			trueVal := true
+			containerStatus.Started = &trueVal
+		} else {
+			// RunPod says RUNNING but no ports exposed - container still starting
+			phase = v1.PodPending
+			containerStatus.State = v1.ContainerState{
+				Waiting: &v1.ContainerStateWaiting{
+					Reason:  "ContainerCreating",
+					Message: "Container reported as running but ports not yet exposed",
+				},
+			}
+			falseVal := false
+			containerStatus.Started = &falseVal
 		}
-		containerStatus.Ready = true
-		trueVal := true
-		containerStatus.Started = &trueVal
 
 	case string(PodStarting):
 		phase = v1.PodPending
@@ -1644,7 +1774,7 @@ func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, conta
 		"namespace", namespace,
 		"pod", podName,
 		"container", containerName)
-	return fmt.Errorf("running commands in container is not supported by RunPod")
+	return fmt.Errorf("container exec is not supported: RunPod API does not provide container exec functionality. Consider using SSH through exposed ports or RunPod's web terminal instead")
 }
 
 // GetContainerLogs implements the ContainerLogsHandlerFunc interface
@@ -1666,7 +1796,7 @@ func (p *Provider) GetContainerLogs(ctx context.Context, namespace, podName, con
 	}
 
 	// If RunPod doesn't support container logs, return an error
-	return nil, fmt.Errorf("container logs not supported by RunPod")
+	return nil, fmt.Errorf("container logs are not available: RunPod's virtual kubelet cannot access container logs due to RunPod API limitations. Logs may be available through RunPod's web console or by configuring log forwarding in your container (e.g., to a centralized logging service)")
 
 	// If RunPod supports logs, you would implement something like:
 	/*
